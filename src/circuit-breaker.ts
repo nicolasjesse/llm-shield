@@ -17,7 +17,11 @@ const KEY_OPENED_AT = 'cb:opened_at';
 
 export async function getState(): Promise<CircuitState> {
   const redis = getRedis();
-  const state = (await redis.get(KEY_STATE)) as CircuitState | null;
+  const raw = await redis.get(KEY_STATE);
+  const VALID_STATES: CircuitState[] = ['CLOSED', 'OPEN', 'HALF_OPEN'];
+  const state: CircuitState | null = VALID_STATES.includes(raw as CircuitState)
+    ? (raw as CircuitState)
+    : null;
 
   if (state === 'OPEN') {
     const openedAt = await redis.get(KEY_OPENED_AT);
@@ -26,6 +30,10 @@ export async function getState(): Promise<CircuitState> {
       return 'HALF_OPEN';
     }
   }
+
+  // NOTE: TOCTOU race — two concurrent requests can both read OPEN, both compute
+  // the elapsed time, and both transition to HALF_OPEN, acting as simultaneous probes.
+  // Fix in production: use a Redis Lua script or SET NX to atomically transition state.
 
   return state ?? 'CLOSED';
 }
@@ -51,6 +59,10 @@ export async function withCircuitBreaker<T>(
   fn: () => Promise<T>,
 ): Promise<T> {
   const state = await getState();
+
+  // NOTE: HALF_OPEN allows one probe at a time conceptually, but concurrent requests
+  // can slip through before state is updated. Fix in production: use SET NX to
+  // atomically claim probe rights before calling fn().
 
   if (state === 'OPEN') {
     throw new CircuitOpenError();

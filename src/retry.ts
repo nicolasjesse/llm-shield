@@ -1,6 +1,6 @@
 export class RetryExhaustedError extends Error {
   constructor(
-    public readonly retryAfter: number,
+    public readonly lastDelaySeconds: number,
     public readonly lastStatus: number,
   ) {
     super(`LLM API failed after 3 retries. Last status: ${lastStatus}`);
@@ -16,7 +16,7 @@ function isRetryable(status: number): boolean {
 
 export async function withRetry(
   fn: () => Promise<Response>,
-  delayMs: (attempt: number) => number = (i) => RETRY_DELAYS_MS[i],
+  delayMs: (attempt: number) => number = (i) => RETRY_DELAYS_MS[Math.min(i, RETRY_DELAYS_MS.length - 1)],
 ): Promise<Response> {
   let lastStatus = 0;
 

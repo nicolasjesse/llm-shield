@@ -22,11 +22,17 @@ export function idempotencyMiddleware() {
       return;
     }
 
+    // NOTE: There is a TOCTOU race here — two concurrent requests with the same key
+    // can both miss the cache and both proceed. Fix in production: use SET NX to
+    // atomically reserve the key before calling next().
+
     // Intercept the response to cache it
     const originalJson = res.json.bind(res);
     res.json = (body: unknown) => {
-      const toCache = JSON.stringify({ status: res.statusCode, body });
-      redis.set(cacheKey, toCache, 'EX', TTL_SECONDS).catch(() => {});
+      if (res.statusCode >= 200 && res.statusCode < 300) {
+        const toCache = JSON.stringify({ status: res.statusCode, body });
+        redis.set(cacheKey, toCache, 'EX', TTL_SECONDS).catch((err) => console.error('[idempotency] Redis cache write failed:', err));
+      }
       return originalJson(body);
     };
 
