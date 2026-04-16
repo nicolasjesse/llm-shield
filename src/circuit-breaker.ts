@@ -14,6 +14,7 @@ const OPEN_DURATION_MS = 30_000;
 const KEY_STATE = 'cb:state';
 const KEY_FAILURES = 'cb:failures';
 const KEY_OPENED_AT = 'cb:opened_at';
+const KEY_PROBE_LOCK = 'cb:probe_lock';
 
 export async function getState(): Promise<CircuitState> {
   const redis = getRedis();
@@ -38,11 +39,20 @@ export async function getState(): Promise<CircuitState> {
   return state ?? 'CLOSED';
 }
 
+// Atomically claim the probe slot when HALF_OPEN.
+// Returns true if this request is the probe; false if another request already claimed it.
+export async function claimProbeSlot(): Promise<boolean> {
+  const redis = getRedis();
+  const result = await redis.set(KEY_PROBE_LOCK, '1', 'EX', 30, 'NX');
+  return result === 'OK';
+}
+
 export async function recordSuccess(): Promise<void> {
   const redis = getRedis();
   await redis.set(KEY_STATE, 'CLOSED');
   await redis.set(KEY_FAILURES, '0');
   await redis.del(KEY_OPENED_AT);
+  await redis.del(KEY_PROBE_LOCK);
 }
 
 export async function recordFailure(): Promise<void> {
@@ -52,6 +62,7 @@ export async function recordFailure(): Promise<void> {
   if (failures >= FAILURE_THRESHOLD) {
     await redis.set(KEY_STATE, 'OPEN');
     await redis.set(KEY_OPENED_AT, Date.now().toString());
+    await redis.del(KEY_PROBE_LOCK); // release so next HALF_OPEN can probe
   }
 }
 

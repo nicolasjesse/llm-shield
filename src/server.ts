@@ -1,6 +1,7 @@
 import express from 'express';
 import { idempotencyMiddleware } from './idempotency';
 import { proxyRequest } from './proxy';
+import { getResult } from './queue';
 import { closeRedis } from './redis';
 import type { ChatRequest } from './types';
 
@@ -19,6 +20,15 @@ app.post('/v1/chat', async (req, res) => {
 
   const result = await proxyRequest(body);
   res.status(result.status).json(result.data);
+});
+
+app.get('/v1/chat/queue/:id', async (req, res) => {
+  const result = await getResult(req.params.id);
+  if (!result) {
+    res.status(404).json({ error: 'Result not ready or expired. Retry shortly.' });
+    return;
+  }
+  res.status(result.status as number).json(result.data);
 });
 
 app.get('/health', (_req, res) => {

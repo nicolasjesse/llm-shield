@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { getState, recordSuccess, recordFailure, withCircuitBreaker, CircuitOpenError } from '../src/circuit-breaker';
+import { getState, recordSuccess, recordFailure, withCircuitBreaker, CircuitOpenError, claimProbeSlot } from '../src/circuit-breaker';
 
 vi.mock('../src/redis', () => ({
   getRedis: vi.fn(),
@@ -14,7 +14,13 @@ function makeMockRedis(overrides: Record<string, string | null> = {}) {
   }
   return {
     get: vi.fn((key: string) => Promise.resolve(store[key] ?? null)),
-    set: vi.fn((key: string, value: string) => { store[key] = value; return Promise.resolve('OK'); }),
+    set: vi.fn((key: string, value: string, ...args: unknown[]) => {
+      // Handle SET NX: only set if key does not exist
+      const isNX = args.includes('NX');
+      if (isNX && store[key] !== undefined) return Promise.resolve(null);
+      store[key] = value;
+      return Promise.resolve('OK');
+    }),
     incr: vi.fn((key: string) => {
       store[key] = String((parseInt(store[key] ?? '0') || 0) + 1);
       return Promise.resolve(parseInt(store[key]));
@@ -91,5 +97,23 @@ describe('circuit breaker', () => {
     const fn = vi.fn().mockRejectedValue(new Error('upstream error'));
     await expect(withCircuitBreaker(fn)).rejects.toThrow('upstream error');
     expect(parseInt(mockRedis._store['cb:failures'] ?? '0')).toBeGreaterThan(0);
+  });
+
+  describe('claimProbeSlot', () => {
+    it('returns true when probe slot is free', async () => {
+      expect(await claimProbeSlot()).toBe(true);
+      expect(mockRedis._store['cb:probe_lock']).toBe('1');
+    });
+
+    it('returns false when probe slot is already taken', async () => {
+      await claimProbeSlot(); // first caller claims it
+      expect(await claimProbeSlot()).toBe(false); // second caller is rejected
+    });
+
+    it('recordSuccess clears the probe lock', async () => {
+      await claimProbeSlot();
+      await recordSuccess();
+      expect(mockRedis._store['cb:probe_lock']).toBeUndefined();
+    });
   });
 });
