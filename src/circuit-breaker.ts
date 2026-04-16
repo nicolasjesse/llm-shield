@@ -16,27 +16,37 @@ const KEY_FAILURES = 'cb:failures';
 const KEY_OPENED_AT = 'cb:opened_at';
 const KEY_PROBE_LOCK = 'cb:probe_lock';
 
+// Atomically reads state and transitions OPEN → HALF_OPEN if the timeout has elapsed.
+// Redis executes Lua scripts single-threaded — no other command can interleave,
+// which eliminates the TOCTOU race where two requests both trigger the HALF_OPEN transition.
+const TRANSITION_SCRIPT = `
+  local state = redis.call('GET', KEYS[1])
+  if state == 'OPEN' then
+    local opened_at = redis.call('GET', KEYS[2])
+    if opened_at ~= false and (tonumber(ARGV[1]) - tonumber(opened_at)) > tonumber(ARGV[2]) then
+      redis.call('SET', KEYS[1], 'HALF_OPEN')
+      return 'HALF_OPEN'
+    end
+    return 'OPEN'
+  end
+  if state == false then return 'CLOSED' end
+  return state
+`;
+
 export async function getState(): Promise<CircuitState> {
   const redis = getRedis();
-  const raw = await redis.get(KEY_STATE);
+  // redis.eval() runs a Lua script atomically inside Redis — not JS eval()
+  const result = await redis.eval(
+    TRANSITION_SCRIPT,
+    2,                          // number of KEYS arguments
+    KEY_STATE,                  // KEYS[1]
+    KEY_OPENED_AT,              // KEYS[2]
+    Date.now().toString(),      // ARGV[1] — current timestamp
+    OPEN_DURATION_MS.toString() // ARGV[2] — threshold
+  ) as string;
+
   const VALID_STATES: CircuitState[] = ['CLOSED', 'OPEN', 'HALF_OPEN'];
-  const state: CircuitState | null = VALID_STATES.includes(raw as CircuitState)
-    ? (raw as CircuitState)
-    : null;
-
-  if (state === 'OPEN') {
-    const openedAt = await redis.get(KEY_OPENED_AT);
-    if (openedAt && Date.now() - parseInt(openedAt) > OPEN_DURATION_MS) {
-      await redis.set(KEY_STATE, 'HALF_OPEN');
-      return 'HALF_OPEN';
-    }
-  }
-
-  // NOTE: TOCTOU race — two concurrent requests can both read OPEN, both compute
-  // the elapsed time, and both transition to HALF_OPEN, acting as simultaneous probes.
-  // Fix in production: use a Redis Lua script or SET NX to atomically transition state.
-
-  return state ?? 'CLOSED';
+  return VALID_STATES.includes(result as CircuitState) ? (result as CircuitState) : 'CLOSED';
 }
 
 // Atomically claim the probe slot when HALF_OPEN.

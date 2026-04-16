@@ -3,12 +3,13 @@ import express, { RequestHandler } from 'express';
 import request from 'supertest';
 import { idempotencyMiddleware } from '../src/idempotency';
 
-// Mock the redis module
 vi.mock('../src/redis', () => ({
   getRedis: vi.fn(),
 }));
 
 import { getRedis } from '../src/redis';
+
+const PENDING_VALUE = '__pending__';
 
 function makeApp(handler: RequestHandler) {
   const app = express();
@@ -18,11 +19,25 @@ function makeApp(handler: RequestHandler) {
   return app;
 }
 
+function makeMockRedis(initialValue: string | null = null) {
+  let stored = initialValue;
+  return {
+    get: vi.fn(() => Promise.resolve(stored)),
+    set: vi.fn((key: string, value: string, ...args: unknown[]) => {
+      const isNX = args.includes('NX');
+      if (isNX && stored !== null) return Promise.resolve(null); // already claimed
+      stored = value;
+      return Promise.resolve('OK');
+    }),
+    _getStored: () => stored,
+  };
+}
+
 describe('idempotencyMiddleware', () => {
-  let mockRedis: { get: ReturnType<typeof vi.fn>; set: ReturnType<typeof vi.fn> };
+  let mockRedis: ReturnType<typeof makeMockRedis>;
 
   beforeEach(() => {
-    mockRedis = { get: vi.fn(), set: vi.fn().mockResolvedValue('OK') };
+    mockRedis = makeMockRedis();
     vi.mocked(getRedis).mockReturnValue(mockRedis as any);
   });
 
@@ -30,25 +45,20 @@ describe('idempotencyMiddleware', () => {
     const handler = vi.fn((req, res) => res.json({ result: 'fresh' }));
     const app = makeApp(handler);
 
-    mockRedis.get.mockResolvedValue(null);
-
-    const response = await request(app)
-      .post('/v1/chat')
-      .send({ prompt: 'hello' });
+    const response = await request(app).post('/v1/chat').send({ prompt: 'hello' });
 
     expect(response.status).toBe(200);
     expect(response.body).toEqual({ result: 'fresh' });
     expect(handler).toHaveBeenCalled();
-    // No key — Redis should not have been called
     expect(mockRedis.get).not.toHaveBeenCalled();
   });
 
-  it('returns cached response on duplicate key', async () => {
+  it('returns cached response on duplicate key (real result in Redis)', async () => {
     const handler = vi.fn((req, res) => res.json({ result: 'fresh' }));
-    const app = makeApp(handler);
-
     const cached = JSON.stringify({ status: 200, body: { result: 'cached' } });
-    mockRedis.get.mockResolvedValue(cached);
+    mockRedis = makeMockRedis(cached);
+    vi.mocked(getRedis).mockReturnValue(mockRedis as any);
+    const app = makeApp(handler);
 
     const response = await request(app)
       .post('/v1/chat')
@@ -60,11 +70,9 @@ describe('idempotencyMiddleware', () => {
     expect(handler).not.toHaveBeenCalled();
   });
 
-  it('caches and calls handler on first request with key', async () => {
+  it('claims key with SET NX on first request and caches real result', async () => {
     const handler = vi.fn((req, res) => res.json({ result: 'fresh' }));
     const app = makeApp(handler);
-
-    mockRedis.get.mockResolvedValue(null); // no cache
 
     const response = await request(app)
       .post('/v1/chat')
@@ -74,11 +82,10 @@ describe('idempotencyMiddleware', () => {
     expect(response.status).toBe(200);
     expect(response.body).toEqual({ result: 'fresh' });
     expect(handler).toHaveBeenCalled();
-    expect(mockRedis.set).toHaveBeenCalledWith(
-      'idempotency:new-key-456',
-      expect.stringContaining('"result":"fresh"'),
-      'EX',
-      86400
-    );
+
+    // After the handler, stored value should be the real result (not pending)
+    const stored = mockRedis._getStored();
+    expect(stored).not.toBe(PENDING_VALUE);
+    expect(stored).toContain('"result":"fresh"');
   });
 });

@@ -15,11 +15,23 @@ function makeMockRedis(overrides: Record<string, string | null> = {}) {
   return {
     get: vi.fn((key: string) => Promise.resolve(store[key] ?? null)),
     set: vi.fn((key: string, value: string, ...args: unknown[]) => {
-      // Handle SET NX: only set if key does not exist
       const isNX = args.includes('NX');
       if (isNX && store[key] !== undefined) return Promise.resolve(null);
       store[key] = value;
       return Promise.resolve('OK');
+    }),
+    // Replicates the Lua transition script logic in JS for tests
+    eval: vi.fn((_script: string, _numkeys: number, stateKey: string, openedAtKey: string, nowStr: string, durationStr: string) => {
+      const state = store[stateKey] ?? null;
+      if (state === 'OPEN') {
+        const openedAt = store[openedAtKey] ?? null;
+        if (openedAt && (parseInt(nowStr) - parseInt(openedAt)) > parseInt(durationStr)) {
+          store[stateKey] = 'HALF_OPEN';
+          return Promise.resolve('HALF_OPEN');
+        }
+        return Promise.resolve('OPEN');
+      }
+      return Promise.resolve(state ?? 'CLOSED');
     }),
     incr: vi.fn((key: string) => {
       store[key] = String((parseInt(store[key] ?? '0') || 0) + 1);
