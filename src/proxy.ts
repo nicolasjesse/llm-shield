@@ -1,6 +1,8 @@
 import { withRetry, RetryExhaustedError } from './retry';
 import { withCircuitBreaker, CircuitOpenError, getState, claimProbeSlot } from './circuit-breaker';
 import { enqueue, dequeueAll, setResult, clearQueue } from './queue';
+import { captureEvent } from './observability';
+import { logger } from './logger';
 
 export interface ProxyRequest {
   model: string;
@@ -93,8 +95,18 @@ export async function proxyRequest(
 
     const data = (await response.json()) as ProxyResponse | ProxyError;
 
+    if (response.status === 401 || response.status === 403) {
+      captureEvent({
+        tag: 'upstream_auth_error',
+        message: `upstream returned ${response.status}`,
+        extra: { upstream_url: UPSTREAM_URL, model: body.model, status: response.status },
+      });
+    }
+
     if (wasProbe) {
-      drainQueueAndProcess().catch((err) => console.error('[queue] drain failed:', err));
+      drainQueueAndProcess().catch((err) =>
+        logger.error({ err }, 'queue drain failed'),
+      );
     }
 
     return { status: response.status, data };
@@ -103,16 +115,31 @@ export async function proxyRequest(
       clearQueue({
         status: 503,
         data: { error: 'Upstream unavailable, circuit re-opened', code: 'circuit_open' },
-      }).catch((e) => console.error('[queue] clear failed:', e));
+      }).catch((e) => logger.error({ err: e }, 'queue clear failed'));
     }
 
     if (err instanceof CircuitOpenError) {
+      captureEvent({
+        tag: 'circuit_open',
+        message: err.message,
+        extra: { upstream_url: UPSTREAM_URL, model: body.model },
+      });
       return {
         status: 503,
         data: { error: err.message, code: 'circuit_open' },
       };
     }
     if (err instanceof RetryExhaustedError) {
+      captureEvent({
+        tag: 'retry_exhausted',
+        message: err.message,
+        extra: {
+          upstream_url: UPSTREAM_URL,
+          model: body.model,
+          last_status: err.lastStatus,
+          last_delay_seconds: err.lastDelaySeconds,
+        },
+      });
       return {
         status: 502,
         data: {
@@ -123,6 +150,7 @@ export async function proxyRequest(
       };
     }
     const message = err instanceof Error ? err.message : 'Unknown proxy error';
+    logger.error({ err, model: body.model }, 'upstream error');
     return {
       status: 500,
       data: { error: message, code: 'upstream_error' },

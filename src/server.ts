@@ -1,11 +1,45 @@
-import express from 'express';
+import 'dotenv/config';
+import express, { type NextFunction, type Request, type Response } from 'express';
 import { idempotencyMiddleware } from './idempotency';
 import { proxyRequest } from './proxy';
 import { getResult } from './queue';
 import { closeRedis } from './redis';
+import { correlationMiddleware } from './correlation';
+import { logger } from './logger';
+import { captureEvent, captureException, initObservability } from './observability';
 import type { ChatRequest } from './types';
 
+const SLOW_REQUEST_MS = Number(process.env.SLOW_REQUEST_MS ?? '5000');
+
+initObservability();
+
 export const app = express();
+
+app.use(correlationMiddleware());
+
+// Request logger + latency threshold
+app.use((req: Request, res: Response, next: NextFunction) => {
+  const start = process.hrtime.bigint();
+  logger.info({ route: `${req.method} ${req.path}` }, 'request received');
+  res.on('finish', () => {
+    const latencyMs = Number(process.hrtime.bigint() - start) / 1_000_000;
+    const payload = {
+      route: `${req.method} ${req.path}`,
+      status_code: res.statusCode,
+      latency_ms: Math.round(latencyMs),
+    };
+    if (latencyMs > SLOW_REQUEST_MS) {
+      captureEvent({
+        tag: 'slow_request',
+        message: `request exceeded ${SLOW_REQUEST_MS}ms threshold`,
+        extra: payload,
+      });
+    } else {
+      logger.info(payload, 'request completed');
+    }
+  });
+  next();
+});
 
 app.use(express.json());
 app.use(idempotencyMiddleware());
@@ -35,8 +69,21 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok' });
 });
 
-// Graceful shutdown
+// Error handler (last middleware) — catches anything a route forgot to handle
+app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+  captureException(err, { tag: 'uncaught_exception' });
+  res.status(500).json({ error: 'internal_error' });
+});
+
+process.on('uncaughtException', (err) => {
+  captureException(err, { tag: 'uncaught_exception' });
+});
+process.on('unhandledRejection', (reason) => {
+  captureException(reason, { tag: 'unhandled_rejection' });
+});
+
 process.on('SIGTERM', async () => {
+  logger.info('SIGTERM received, closing Redis');
   await closeRedis();
   process.exit(0);
 });
@@ -44,6 +91,6 @@ process.on('SIGTERM', async () => {
 if (require.main === module) {
   const PORT = parseInt(process.env.PORT ?? '3000');
   app.listen(PORT, () => {
-    console.log(`LLM Shield running on port ${PORT}`);
+    logger.info({ port: PORT }, 'LLM Shield started');
   });
 }

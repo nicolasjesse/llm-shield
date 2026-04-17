@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import { getRedis } from './redis';
+import { logger } from './logger';
 
 const TTL_SECONDS = 86400; // 24 hours
 const PENDING_VALUE = '__pending__';
@@ -39,7 +40,7 @@ export function idempotencyMiddleware() {
           if (res.statusCode >= 200 && res.statusCode < 300) {
             const toCache = JSON.stringify({ status: res.statusCode, body });
             redis.set(cacheKey, toCache, 'EX', TTL_SECONDS).catch((err) =>
-              console.error('[idempotency] Redis cache write failed:', err),
+              logger.error({ err, component: 'idempotency' }, 'Redis cache write failed'),
             );
           }
           return originalJson(body);
@@ -62,7 +63,10 @@ export function idempotencyMiddleware() {
     }
 
     // Timed out waiting — degrade gracefully by proceeding without caching
-    console.warn('[idempotency] Timed out waiting for pending result, proceeding without cache');
+    logger.warn(
+      { component: 'idempotency', cache_key: cacheKey, timeout_ms: POLL_TIMEOUT_MS },
+      'timed out waiting for pending result, proceeding without cache',
+    );
     next();
   };
 }

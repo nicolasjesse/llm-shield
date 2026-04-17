@@ -37,6 +37,26 @@ Request → Idempotency (cache check) → Circuit Breaker (fail-fast) → Retry 
 - **Circuit Breaker** — after 5 consecutive failures, rejects all requests for 30s (returns `503`) instead of hammering a struggling upstream
 - **Retry** — automatically retries `429` and `5xx` responses with exponential backoff: `1s → 2s → 4s`
 
+## Observability
+
+Every request is instrumented so operators can answer "what broke, when, and why?" without attaching a debugger.
+
+- **Structured JSON logs** (via `pino`) on every request and every state transition — one line per event, machine-parseable, pipe-able to Loki / Datadog / any log aggregator.
+- **Correlation IDs** on every request. If the client sends `X-Correlation-ID`, it's preserved end-to-end (distributed tracing friendly). Otherwise a UUID is generated. The ID is echoed on the response and included in every log line for that request via `AsyncLocalStorage`.
+- **Sentry integration** (optional — set `SENTRY_DSN` to enable). Capture events fire at the real failure points:
+  - `circuit_open` — circuit breaker rejected a request
+  - `retry_exhausted` — upstream failed all retries
+  - `upstream_auth_error` — upstream returned `401`/`403`
+  - `slow_request` — request exceeded `SLOW_REQUEST_MS` (default `5000`)
+  - `uncaught_exception` / `unhandled_rejection` — process-level handlers
+
+Without a `SENTRY_DSN` set, capture calls are safe no-ops — you still get the structured logs and correlation IDs. Useful in dev and tests.
+
+```bash
+# Example log line on a circuit-open event
+{"level":40,"time":"2026-04-17T12:00:00.000Z","service":"llm-shield","correlation_id":"7a1c-...","event":"circuit_open","upstream_url":"https://api.openai.com/v1/chat/completions","model":"gpt-4","msg":"circuit is OPEN"}
+```
+
 ## Stack
 
 - **Runtime:** Node.js 20 + TypeScript
@@ -77,3 +97,8 @@ npm test
 | `REDIS_HOST` | `localhost` | Redis hostname |
 | `REDIS_PORT` | `6379` | Redis port |
 | `PORT` | `3000` | Server port |
+| `LOG_LEVEL` | `info` | pino log level (`trace`\|`debug`\|`info`\|`warn`\|`error`\|`silent`) |
+| `SLOW_REQUEST_MS` | `5000` | Requests exceeding this emit a `slow_request` event |
+| `SENTRY_DSN` | unset | When set, enables Sentry capture at failure points |
+| `SENTRY_TRACES_SAMPLE_RATE` | `0` | Sentry performance sampling rate (0–1) |
+| `RELEASE` | unset | Release tag forwarded to Sentry for source-map correlation |
