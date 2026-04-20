@@ -37,6 +37,19 @@ Request → Idempotency (cache check) → Circuit Breaker (fail-fast) → Retry 
 - **Circuit Breaker** — after 5 consecutive failures, rejects all requests for 30s (returns `503`) instead of hammering a struggling upstream
 - **Retry** — automatically retries `429` and `5xx` responses with exponential backoff: `1s → 2s → 4s`
 
+## Streaming
+
+`llm-shield` forwards streaming requests (`Accept: text/event-stream` or `stream: true` in the body) byte-for-byte to the upstream. The proxy detects streaming on the way in and routes around the buffered middleware stack — chunks reach the client as fast as the upstream produces them.
+
+```bash
+curl -N -X POST http://localhost:3000/v1/chat \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Count to 3"}],"stream":true}'
+```
+
+**What this means in practice:** the three resilience patterns above (idempotency, circuit breaker, retry) currently apply only to buffered requests. Streaming requests get a clean pass-through. Stream-aware variants of each pattern — record-and-replay idempotency (Redis chunk log + replay), circuit-breaker signals driven by time-to-first-byte, and opt-in resume retry — are on the roadmap.
+
 ## Observability
 
 Every request is instrumented so operators can answer "what broke, when, and why?" without attaching a debugger.
