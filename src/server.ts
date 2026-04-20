@@ -2,9 +2,10 @@ import 'dotenv/config';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { idempotencyMiddleware } from './idempotency';
 import { proxyRequest } from './proxy';
-import { isStreamingRequest, proxyStreamRequest } from './stream';
+import { isStreamingRequest, proxyStreamRequest, proxyStreamRequestRecording } from './stream';
+import { streamIdempotencyMiddleware, keyChunks, SENTINEL_END, SENTINEL_ERR, markDone, markFailed } from './stream-idempotency';
 import { getResult } from './queue';
-import { closeRedis } from './redis';
+import { closeRedis, getRedis } from './redis';
 import { correlationMiddleware } from './correlation';
 import { logger } from './logger';
 import { captureEvent, captureException, initObservability } from './observability';
@@ -44,6 +45,7 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 
 app.use(express.json());
 app.use(idempotencyMiddleware());
+app.use(streamIdempotencyMiddleware());
 
 app.post('/v1/chat', async (req, res) => {
   const body = req.body as ChatRequest;
@@ -54,6 +56,31 @@ app.post('/v1/chat', async (req, res) => {
   }
 
   if (isStreamingRequest(req, body)) {
+    const claim = (req as any).streamIdempotency as { key: string; claimed: true } | undefined;
+    if (claim?.claimed) {
+      const redis = getRedis();
+      const chunksKey = keyChunks(claim.key);
+      await proxyStreamRequestRecording(
+        body as Parameters<typeof proxyStreamRequestRecording>[0],
+        res,
+        (buf) => {
+          redis.rpush(chunksKey, buf.toString('base64')).catch((err) =>
+            logger.error({ err, component: 'stream-idem' }, 'chunk RPUSH failed'),
+          );
+        },
+        (ok, status, contentType) => {
+          const terminal = ok ? SENTINEL_END : SENTINEL_ERR;
+          redis.rpush(chunksKey, terminal).catch((err) =>
+            logger.error({ err, component: 'stream-idem' }, 'terminal RPUSH failed'),
+          );
+          const finalize = ok
+            ? markDone(claim.key, status, contentType)
+            : markFailed(claim.key, status, contentType);
+          finalize.catch((err) => logger.error({ err, component: 'stream-idem' }, 'finalize failed'));
+        },
+      );
+      return;
+    }
     await proxyStreamRequest(body as Parameters<typeof proxyStreamRequest>[0], res);
     return;
   }

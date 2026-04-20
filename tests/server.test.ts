@@ -12,6 +12,19 @@ vi.mock('../src/redis', () => ({
   closeRedis: vi.fn(),
 }));
 
+// Mock stream-idempotency so streamIdempotencyMiddleware returns a middleware that delegates to
+// a replaceable handler. Default is a pass-through. Tests override __setStreamIdemHandler to
+// inject req.streamIdempotency without having to re-mount the middleware.
+let __streamIdemHandler: (req: any, res: any, next: any) => void = (_req, _res, next) => next();
+vi.mock('../src/stream-idempotency', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/stream-idempotency')>();
+  return {
+    ...actual,
+    streamIdempotencyMiddleware: () => (req: any, res: any, next: any) =>
+      __streamIdemHandler(req, res, next),
+  };
+});
+
 import { proxyRequest } from '../src/proxy';
 import { getRedis } from '../src/redis';
 
@@ -24,7 +37,7 @@ const mockSuccessResponse = {
 };
 
 describe('POST /v1/chat', () => {
-  let mockRedis: { get: ReturnType<typeof vi.fn>; set: ReturnType<typeof vi.fn>; del: ReturnType<typeof vi.fn> };
+  let mockRedis: { get: ReturnType<typeof vi.fn>; set: ReturnType<typeof vi.fn>; del: ReturnType<typeof vi.fn>; rpush?: ReturnType<typeof vi.fn>; expire?: ReturnType<typeof vi.fn> };
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -32,7 +45,9 @@ describe('POST /v1/chat', () => {
       get: vi.fn().mockResolvedValue(null),
       set: vi.fn().mockResolvedValue('OK'),
       del: vi.fn().mockResolvedValue(1),
-    };
+      rpush: vi.fn().mockResolvedValue(1),
+      expire: vi.fn().mockResolvedValue(1),
+    } as any;
     vi.mocked(getRedis).mockReturnValue(mockRedis as any);
   });
 
@@ -97,6 +112,41 @@ describe('POST /v1/chat', () => {
     expect(proxyRequest).not.toHaveBeenCalled();
     expect(spy).toHaveBeenCalledOnce();
     spy.mockRestore();
+  });
+
+  it('records claimed streaming requests via proxyStreamRequestRecording', async () => {
+    const streamModule = await import('../src/stream');
+
+    // Override the delegating handler to inject a claim onto req.
+    __streamIdemHandler = (req: any, _res: any, next: any) => {
+      req.streamIdempotency = { key: 'recorded-key', claimed: true };
+      next();
+    };
+
+    const recSpy = vi.spyOn(streamModule, 'proxyStreamRequestRecording').mockImplementation(
+      async (_b, res, onChunk, onEnd) => {
+        onChunk(Buffer.from('data: ok\n\n'));
+        onEnd(true, 200, 'text/event-stream');
+        res.status(200).setHeader('content-type', 'text/event-stream');
+        res.end('data: ok\n\n');
+      },
+    );
+    const passSpy = vi.spyOn(streamModule, 'proxyStreamRequest').mockImplementation(async () => {});
+
+    const res = await request(app)
+      .post('/v1/chat')
+      .set('Accept', 'text/event-stream')
+      .set('Idempotency-Key', 'key-for-record-test')
+      .send({ model: 'gpt-4o', messages: [{ role: 'user', content: 'Hi' }], stream: true });
+
+    expect(res.status).toBe(200);
+    expect(recSpy).toHaveBeenCalledOnce();
+    expect(passSpy).not.toHaveBeenCalled();
+
+    // Restore
+    __streamIdemHandler = (_req: any, _res: any, next: any) => next();
+    recSpy.mockRestore();
+    passSpy.mockRestore();
   });
 
   it('returns cached response on duplicate idempotency key', async () => {
