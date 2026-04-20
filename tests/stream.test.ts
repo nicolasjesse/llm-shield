@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { isStreamingRequest, proxyStreamRequest } from '../src/stream';
+import { isStreamingRequest, proxyStreamRequest, proxyStreamRequestRecording } from '../src/stream';
 import { PassThrough } from 'node:stream';
 
 describe('isStreamingRequest', () => {
@@ -81,5 +81,82 @@ describe('proxyStreamRequest', () => {
 
     expect(res.status).toHaveBeenCalledWith(502);
     expect(Buffer.concat(chunks).toString('utf8')).toBe('{"error":"nope"}');
+  });
+});
+
+describe('proxyStreamRequestRecording', () => {
+  it('forwards to res AND invokes onChunk for each chunk, then onEnd(true, …)', async () => {
+    const body = 'data: a\n\ndata: b\n\ndata: [DONE]\n\n';
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } }),
+    );
+    const chunks: string[] = [];
+    const recorded: Buffer[] = [];
+    let endResult: { ok: boolean; status: number; contentType: string } | null = null;
+
+    const res = new PassThrough() as any;
+    res.setHeader = vi.fn();
+    res.status = vi.fn().mockReturnValue(res);
+    res.flushHeaders = vi.fn();
+    res.on = res.on.bind(res);
+    res.on('data', (c: Buffer) => chunks.push(c.toString('utf8')));
+
+    await proxyStreamRequestRecording(
+      { model: 'm', messages: [{ role: 'user', content: 'hi' }], stream: true },
+      res,
+      (buf) => { recorded.push(buf); },
+      (ok, status, ct) => { endResult = { ok, status, contentType: ct }; },
+      { fetchImpl: fetchMock, upstreamUrl: 'http://fake', apiKey: 'k' },
+    );
+
+    expect(chunks.join('')).toBe(body);
+    expect(Buffer.concat(recorded).toString('utf8')).toBe(body);
+    expect(endResult).toEqual({ ok: true, status: 200, contentType: 'text/event-stream' });
+  });
+
+  it('keeps invoking onChunk after client disconnects but stops res.write', async () => {
+    const encoder = new TextEncoder();
+    let release: (() => void) | null = null;
+    const upstreamStream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        controller.enqueue(encoder.encode('data: 1\n\n'));
+        await new Promise<void>((resolve) => { release = resolve; });
+        controller.enqueue(encoder.encode('data: 2\n\n'));
+        controller.close();
+      },
+    });
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(upstreamStream, { status: 200, headers: { 'content-type': 'text/event-stream' } }),
+    );
+
+    const recorded: Buffer[] = [];
+    const written: Buffer[] = [];
+    const listeners: Record<string, (() => void)[]> = {};
+    const res: any = {
+      setHeader: vi.fn(),
+      status: vi.fn().mockReturnThis(),
+      flushHeaders: vi.fn(),
+      write: (c: Buffer) => { written.push(c); return true; },
+      end: vi.fn(),
+      on: (evt: string, cb: () => void) => {
+        (listeners[evt] ??= []).push(cb);
+      },
+    };
+
+    const promise = proxyStreamRequestRecording(
+      { model: 'm', messages: [{ role: 'user', content: 'hi' }], stream: true },
+      res,
+      (b) => recorded.push(b),
+      () => {},
+      { fetchImpl: fetchMock, upstreamUrl: 'http://fake', apiKey: 'k' },
+    );
+
+    await new Promise((r) => setTimeout(r, 20));
+    listeners['close']?.forEach((cb) => cb());
+    release?.();
+    await promise;
+
+    expect(Buffer.concat(recorded).toString('utf8')).toBe('data: 1\n\ndata: 2\n\n');
+    expect(Buffer.concat(written).toString('utf8')).toBe('data: 1\n\n');
   });
 });
