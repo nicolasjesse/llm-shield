@@ -10,13 +10,23 @@ import {
   readMeta,
   markDone,
   markFailed,
+  streamIdempotencyMiddleware,
 } from '../src/stream-idempotency';
 
 vi.mock('../src/redis', () => ({
   getRedis: vi.fn(),
 }));
 
+vi.mock('../src/stream', () => ({
+  isStreamingRequest: vi.fn((_req: unknown, body: unknown) => {
+    return !!(body && typeof body === 'object' && (body as any).stream === true);
+  }),
+  proxyStreamRequest: vi.fn(),
+  proxyStreamRequestRecording: vi.fn(),
+}));
+
 import { getRedis } from '../src/redis';
+import { Readable } from 'node:stream';
 
 describe('stream-idempotency helpers', () => {
   let mockRedis: any;
@@ -93,5 +103,127 @@ describe('stream-idempotency helpers', () => {
       'EX',
       300,
     );
+  });
+});
+
+describe('streamIdempotencyMiddleware', () => {
+  let mockRedis: any;
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockRedis = {
+      set: vi.fn(),
+      get: vi.fn(),
+      rpush: vi.fn(),
+      lrange: vi.fn(),
+      llen: vi.fn(),
+      lindex: vi.fn(),
+      expire: vi.fn(),
+    };
+    vi.mocked(getRedis).mockReturnValue(mockRedis);
+  });
+
+  function makeReq(opts: { key?: string; accept?: string; body?: any } = {}) {
+    return {
+      headers: {
+        ...(opts.key ? { 'idempotency-key': opts.key } : {}),
+        ...(opts.accept ? { accept: opts.accept } : {}),
+      },
+      body: opts.body ?? { model: 'm', messages: [{ role: 'user', content: 'hi' }], stream: true },
+    } as any;
+  }
+
+  function makeRes() {
+    const chunks: Buffer[] = [];
+    const res: any = new Readable({ read() {} });
+    res.setHeader = vi.fn();
+    res.status = vi.fn().mockReturnValue(res);
+    res.write = (c: Buffer) => { chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)); return true; };
+    res.end = vi.fn((c?: Buffer) => { if (c) chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)); });
+    res._captured = chunks;
+    return res;
+  }
+
+  it('passes through when request is not streaming', async () => {
+    const mw = streamIdempotencyMiddleware();
+    const next = vi.fn();
+    await mw(makeReq({ key: 'k', body: { model: 'm', messages: [] } }), makeRes(), next);
+    expect(next).toHaveBeenCalled();
+    expect(mockRedis.set).not.toHaveBeenCalled();
+  });
+
+  it('passes through when no idempotency key', async () => {
+    const mw = streamIdempotencyMiddleware();
+    const next = vi.fn();
+    await mw(makeReq({ accept: 'text/event-stream' }), makeRes(), next);
+    expect(next).toHaveBeenCalled();
+    expect(mockRedis.set).not.toHaveBeenCalled();
+  });
+
+  it('claims + calls next and marks req.streamIdempotency on first hit', async () => {
+    mockRedis.set.mockResolvedValue('OK');
+    const mw = streamIdempotencyMiddleware();
+    const req = makeReq({ key: 'k1', accept: 'text/event-stream' });
+    const next = vi.fn();
+    await mw(req, makeRes(), next);
+    expect(next).toHaveBeenCalled();
+    expect(req.streamIdempotency).toEqual({ key: 'k1', claimed: true });
+  });
+
+  it('replays a completed log with the cached content-type and status', async () => {
+    mockRedis.set.mockResolvedValue(null);
+    mockRedis.get.mockResolvedValue(JSON.stringify({ state: 'done', status: 200, contentType: 'text/event-stream' }));
+    mockRedis.lrange.mockResolvedValue([
+      Buffer.from('data: a\n\n').toString('base64'),
+      Buffer.from('data: b\n\n').toString('base64'),
+      '__END__',
+    ]);
+    const mw = streamIdempotencyMiddleware();
+    const res = makeRes();
+    const next = vi.fn();
+    await mw(makeReq({ key: 'k2', accept: 'text/event-stream' }), res, next);
+    expect(next).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(res.setHeader).toHaveBeenCalledWith('content-type', 'text/event-stream');
+    expect(Buffer.concat(res._captured).toString('utf8')).toBe('data: a\n\ndata: b\n\n');
+    expect(res.end).toHaveBeenCalled();
+  });
+
+  it('returns 502 when cached state is failed', async () => {
+    mockRedis.set.mockResolvedValue(null);
+    mockRedis.get.mockResolvedValue(JSON.stringify({ state: 'failed', status: 502, contentType: 'application/json' }));
+    const mw = streamIdempotencyMiddleware();
+    const res = makeRes();
+    const next = vi.fn();
+    await mw(makeReq({ key: 'k3', accept: 'text/event-stream' }), res, next);
+    expect(next).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(502);
+    expect(res.end).toHaveBeenCalled();
+  });
+
+  it('tails an in-flight log: reads new entries until __END__', async () => {
+    mockRedis.set.mockResolvedValue(null);
+    mockRedis.get
+      .mockResolvedValueOnce(JSON.stringify({ state: 'in_flight' }))
+      .mockResolvedValueOnce(JSON.stringify({ state: 'in_flight' }))
+      .mockResolvedValue(JSON.stringify({ state: 'done', status: 200, contentType: 'text/event-stream' }));
+
+    mockRedis.llen
+      .mockResolvedValueOnce(0)
+      .mockResolvedValueOnce(1)
+      .mockResolvedValueOnce(2)
+      .mockResolvedValueOnce(3);
+
+    mockRedis.lindex
+      .mockResolvedValueOnce(Buffer.from('data: a\n\n').toString('base64'))
+      .mockResolvedValueOnce(Buffer.from('data: b\n\n').toString('base64'))
+      .mockResolvedValueOnce('__END__');
+
+    const mw = streamIdempotencyMiddleware({ pollIntervalMs: 5, tailTimeoutMs: 1000 });
+    const res = makeRes();
+    const next = vi.fn();
+    await mw(makeReq({ key: 'k4', accept: 'text/event-stream' }), res, next);
+
+    expect(next).not.toHaveBeenCalled();
+    expect(Buffer.concat(res._captured).toString('utf8')).toBe('data: a\n\ndata: b\n\n');
   });
 });
