@@ -79,6 +79,26 @@ describe('POST /v1/chat', () => {
     expect(res.body.code).toBe('circuit_open');
   });
 
+  it('routes streaming requests to proxyStreamRequest, not proxyRequest', async () => {
+    const streamModule = await import('../src/stream');
+    const spy = vi.spyOn(streamModule, 'proxyStreamRequest').mockImplementation(async (_b, res) => {
+      res.status(200).setHeader('content-type', 'text/event-stream');
+      res.end('data: ok\n\n');
+    });
+
+    const res = await request(app)
+      .post('/v1/chat')
+      .set('Accept', 'text/event-stream')
+      .send({ model: 'gpt-4o', messages: [{ role: 'user', content: 'Hello' }], stream: true });
+
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toContain('text/event-stream');
+    expect(res.text).toBe('data: ok\n\n');
+    expect(proxyRequest).not.toHaveBeenCalled();
+    expect(spy).toHaveBeenCalledOnce();
+    spy.mockRestore();
+  });
+
   it('returns cached response on duplicate idempotency key', async () => {
     const cached = JSON.stringify({ status: 200, body: mockSuccessResponse });
     mockRedis.get.mockResolvedValue(cached);
