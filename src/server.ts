@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { idempotencyMiddleware } from './idempotency';
 import { proxyRequest } from './proxy';
+import { isStreamingRequest, proxyStreamRequest } from './stream';
 import { getResult } from './queue';
 import { closeRedis } from './redis';
 import { correlationMiddleware } from './correlation';
@@ -49,6 +50,11 @@ app.post('/v1/chat', async (req, res) => {
 
   if (!body.model || !body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
     res.status(400).json({ error: 'model and messages are required' });
+    return;
+  }
+
+  if (isStreamingRequest(req, body)) {
+    await proxyStreamRequest(body as Parameters<typeof proxyStreamRequest>[0], res);
     return;
   }
 
