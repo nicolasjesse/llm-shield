@@ -1,6 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import { getRedis } from './redis';
 import { logger } from './logger';
+import { isStreamingRequest } from './stream';
 
 const TTL_SECONDS = 86400; // 24 hours
 const PENDING_VALUE = '__pending__';
@@ -13,6 +14,11 @@ export function idempotencyMiddleware() {
     const key = req.headers['idempotency-key'] as string | undefined;
 
     if (!key) {
+      next();
+      return;
+    }
+
+    if (isStreamingRequest(req, req.body)) {
       next();
       return;
     }
