@@ -25,7 +25,16 @@ vi.mock('../src/stream', () => ({
   proxyStreamRequestRecording: vi.fn(),
 }));
 
+vi.mock('../src/stream-circuit-breaker', async (importOrig) => {
+  const orig = await importOrig<typeof import('../src/stream-circuit-breaker')>();
+  return {
+    ...orig,
+    checkCircuitOrReject: vi.fn().mockResolvedValue(true),
+  };
+});
+
 import { getRedis } from '../src/redis';
+import { checkCircuitOrReject } from '../src/stream-circuit-breaker';
 import { Readable } from 'node:stream';
 
 describe('stream-idempotency helpers', () => {
@@ -225,5 +234,15 @@ describe('streamIdempotencyMiddleware', () => {
 
     expect(next).not.toHaveBeenCalled();
     expect(Buffer.concat(res._captured).toString('utf8')).toBe('data: a\n\ndata: b\n\n');
+  });
+
+  it('rejects before claiming when circuit breaker is OPEN (checkCircuitOrReject returns false)', async () => {
+    vi.mocked(checkCircuitOrReject).mockResolvedValueOnce(false);
+    const mw = streamIdempotencyMiddleware();
+    const res = makeRes();
+    const next = vi.fn();
+    await mw(makeReq({ key: 'k5', accept: 'text/event-stream' }), res, next);
+    expect(next).not.toHaveBeenCalled();
+    expect(mockRedis.set).not.toHaveBeenCalled();
   });
 });
