@@ -1,5 +1,6 @@
 import type { Request, Response as ExpressResponse } from 'express';
 import { logger } from './logger';
+import { checkCircuitOrReject, recordStreamOutcome } from './stream-circuit-breaker';
 
 export function isStreamingRequest(req: Request, body: unknown): boolean {
   const accept = req.headers.accept;
@@ -23,11 +24,15 @@ export async function proxyStreamRequest(
   res: ExpressResponse,
   opts: StreamProxyOptions = {},
 ): Promise<void> {
+  if (!(await checkCircuitOrReject(res))) return;
+
   const fetchImpl = opts.fetchImpl ?? fetch;
   const upstreamUrl = opts.upstreamUrl ?? process.env.LLM_UPSTREAM_URL ?? 'https://api.openai.com/v1/chat/completions';
   const apiKey = opts.apiKey ?? process.env.LLM_API_KEY ?? '';
 
   const upstreamBody = { ...body, stream: true };
+  const startedAt = Date.now();
+  let firstByteAtMs: number | null = null;
 
   let upstream: Response;
   try {
@@ -42,6 +47,7 @@ export async function proxyStreamRequest(
     });
   } catch (err) {
     logger.error({ err, upstream_url: upstreamUrl }, 'stream upstream connection failed');
+    await recordStreamOutcome({ terminationReason: 'connection_error', ttfbMs: null, firstByteAtMs: null, droppedAtMs: null });
     res.status(502).setHeader('content-type', 'application/json');
     res.end(JSON.stringify({ error: 'upstream connection failed', code: 'upstream_error' }));
     return;
@@ -54,7 +60,15 @@ export async function proxyStreamRequest(
     (res as { flushHeaders: () => void }).flushHeaders();
   }
 
+  if (upstream.status >= 400) {
+    await recordStreamOutcome({ terminationReason: 'http_error', ttfbMs: null, firstByteAtMs: null, droppedAtMs: null });
+    // still forward the upstream error body to the client (existing behavior)
+  }
+
   if (!upstream.body) {
+    if (upstream.status < 400) {
+      await recordStreamOutcome({ terminationReason: 'done', ttfbMs: firstByteAtMs, firstByteAtMs, droppedAtMs: null });
+    }
     res.end();
     return;
   }
@@ -64,11 +78,17 @@ export async function proxyStreamRequest(
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
+      if (firstByteAtMs === null) firstByteAtMs = Date.now() - startedAt;
       res.write(Buffer.from(value));
+    }
+    if (upstream.status < 400) {
+      await recordStreamOutcome({ terminationReason: 'done', ttfbMs: firstByteAtMs, firstByteAtMs, droppedAtMs: null });
     }
     res.end();
   } catch (err) {
+    const droppedAtMs = Date.now() - startedAt;
     logger.error({ err, upstream_url: upstreamUrl }, 'stream forwarding interrupted');
+    await recordStreamOutcome({ terminationReason: 'upstream_drop', ttfbMs: firstByteAtMs, firstByteAtMs, droppedAtMs });
     res.end();
   }
 }
@@ -83,11 +103,15 @@ export async function proxyStreamRequestRecording(
   onEnd: RecordEndFn,
   opts: StreamProxyOptions = {},
 ): Promise<void> {
+  if (!(await checkCircuitOrReject(res))) return;
+
   const fetchImpl = opts.fetchImpl ?? fetch;
   const upstreamUrl = opts.upstreamUrl ?? process.env.LLM_UPSTREAM_URL ?? 'https://api.openai.com/v1/chat/completions';
   const apiKey = opts.apiKey ?? process.env.LLM_API_KEY ?? '';
 
   const upstreamBody = { ...body, stream: true };
+  const startedAt = Date.now();
+  let firstByteAtMs: number | null = null;
 
   let clientAlive = true;
   if (typeof (res as { on?: Function }).on === 'function') {
@@ -111,6 +135,7 @@ export async function proxyStreamRequestRecording(
     logger.error({ err, upstream_url: upstreamUrl }, 'stream upstream connection failed');
     const ct = 'application/json';
     const errBody = Buffer.from(JSON.stringify({ error: 'upstream connection failed', code: 'upstream_error' }));
+    await recordStreamOutcome({ terminationReason: 'connection_error', ttfbMs: null, firstByteAtMs: null, droppedAtMs: null });
     onChunk(errBody);
     onEnd(false, 502, ct);
     if (clientAlive) {
@@ -129,8 +154,15 @@ export async function proxyStreamRequestRecording(
     }
   }
 
+  if (upstream.status >= 400) {
+    await recordStreamOutcome({ terminationReason: 'http_error', ttfbMs: null, firstByteAtMs: null, droppedAtMs: null });
+  }
+
   if (!upstream.body) {
-    onEnd(true, upstream.status, contentType);
+    if (upstream.status < 400) {
+      await recordStreamOutcome({ terminationReason: 'done', ttfbMs: firstByteAtMs, firstByteAtMs, droppedAtMs: null });
+    }
+    onEnd(upstream.status < 400, upstream.status, contentType);
     if (clientAlive) res.end();
     return;
   }
@@ -140,6 +172,7 @@ export async function proxyStreamRequestRecording(
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
+      if (firstByteAtMs === null) firstByteAtMs = Date.now() - startedAt;
       const buf = Buffer.from(value);
       onChunk(buf);
       if (clientAlive) {
@@ -150,10 +183,15 @@ export async function proxyStreamRequestRecording(
         }
       }
     }
+    if (upstream.status < 400) {
+      await recordStreamOutcome({ terminationReason: 'done', ttfbMs: firstByteAtMs, firstByteAtMs, droppedAtMs: null });
+    }
     onEnd(true, upstream.status, contentType);
     if (clientAlive) res.end();
   } catch (err) {
+    const droppedAtMs = Date.now() - startedAt;
     logger.error({ err, upstream_url: upstreamUrl }, 'stream recording interrupted');
+    await recordStreamOutcome({ terminationReason: 'upstream_drop', ttfbMs: firstByteAtMs, firstByteAtMs, droppedAtMs });
     onEnd(false, upstream.status || 502, contentType);
     if (clientAlive) res.end();
   }

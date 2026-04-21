@@ -29,6 +29,13 @@ describe('end-to-end: two concurrent streaming requests with same idempotency ke
         return arr.slice(s, end);
       }),
       expire: vi.fn(async (k: string, s: number) => { ttls.set(k, s); return 1; }),
+      eval: vi.fn(async () => 'CLOSED'),
+      del: vi.fn(async () => 1),
+      incr: vi.fn(async (k: string) => {
+        const v = Number(kv.get(k) ?? '0') + 1;
+        kv.set(k, String(v));
+        return v;
+      }),
     };
     vi.doMock('../src/redis', () => ({ getRedis: () => redis, closeRedis: vi.fn() }));
 

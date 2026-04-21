@@ -65,6 +65,7 @@ export async function markFailed(key: string, status: number, contentType: strin
 // ── Middleware ──────────────────────────────────────────────────────────────
 
 import { isStreamingRequest } from './stream';
+import { checkCircuitOrReject } from './stream-circuit-breaker';
 import { logger } from './logger';
 
 export interface StreamIdempotencyOptions {
@@ -85,6 +86,8 @@ export function streamIdempotencyMiddleware(opts: StreamIdempotencyOptions = {})
     const key = req.headers['idempotency-key'] as string | undefined;
     if (!key) { next(); return; }
     if (!isStreamingRequest(req, req.body)) { next(); return; }
+
+    if (!(await checkCircuitOrReject(res))) return;
 
     const claimed = await claimKey(key);
     if (claimed) {
