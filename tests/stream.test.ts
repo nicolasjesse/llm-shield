@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { isStreamingRequest, proxyStreamRequest, proxyStreamRequestRecording } from '../src/stream';
+import { isStreamingRequest, proxyStreamRequest, proxyStreamRequestRecording, withStreamRetry } from '../src/stream';
 import { PassThrough } from 'node:stream';
-import { recordStreamOutcome, checkCircuitOrReject } from '../src/stream-circuit-breaker';
+import { recordStreamOutcome, checkCircuitOrReject, type StreamOutcome } from '../src/stream-circuit-breaker';
 
 vi.mock('../src/stream-circuit-breaker', async (orig) => {
   const actual = await orig<typeof import('../src/stream-circuit-breaker')>();
@@ -36,6 +36,79 @@ describe('isStreamingRequest', () => {
   it('handles Accept with multiple media types', () => {
     const req = { headers: { accept: 'application/json, text/event-stream' } } as any;
     expect(isStreamingRequest(req, {})).toBe(true);
+  });
+});
+
+describe('withStreamRetry', () => {
+  const conn = (): StreamOutcome => ({ terminationReason: 'connection_error', ttfbMs: null, firstByteAtMs: null, droppedAtMs: null });
+  const done = (): StreamOutcome => ({ terminationReason: 'done', ttfbMs: 10, firstByteAtMs: 10, droppedAtMs: null });
+  const httpErr = (): StreamOutcome => ({ terminationReason: 'http_error', ttfbMs: null, firstByteAtMs: null, droppedAtMs: null });
+
+  it('returns immediately on success without retrying', async () => {
+    const attempt = vi.fn().mockResolvedValue(done());
+    const outcome = await withStreamRetry(attempt, () => 0);
+    expect(outcome.terminationReason).toBe('done');
+    expect(attempt).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries connection_error then succeeds', async () => {
+    const attempt = vi.fn().mockResolvedValueOnce(conn()).mockResolvedValue(done());
+    const outcome = await withStreamRetry(attempt, () => 0);
+    expect(outcome.terminationReason).toBe('done');
+    expect(attempt).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not retry a committed failure (http_error)', async () => {
+    const attempt = vi.fn().mockResolvedValue(httpErr());
+    const outcome = await withStreamRetry(attempt, () => 0);
+    expect(outcome.terminationReason).toBe('http_error');
+    expect(attempt).toHaveBeenCalledTimes(1);
+  });
+
+  it('exhausts after 3 connection_errors and returns the last outcome', async () => {
+    const attempt = vi.fn().mockResolvedValue(conn());
+    const outcome = await withStreamRetry(attempt, () => 0);
+    expect(outcome.terminationReason).toBe('connection_error');
+    expect(attempt).toHaveBeenCalledTimes(3);
+  });
+
+  it('marks only the final attempt as isFinalAttempt', async () => {
+    const flags: boolean[] = [];
+    const attempt = vi.fn(async (ctx: { isFinalAttempt: boolean }) => {
+      flags.push(ctx.isFinalAttempt);
+      return conn();
+    });
+    await withStreamRetry(attempt, () => 0);
+    expect(flags).toEqual([false, false, true]);
+  });
+
+  it('composes with proxyStreamRequest: retries a dropped connection, streams on success, no premature 502', async () => {
+    vi.mocked(checkCircuitOrReject).mockReset().mockResolvedValue(true);
+    vi.mocked(recordStreamOutcome).mockReset().mockResolvedValue();
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(new Error('ECONNREFUSED'))
+      .mockResolvedValue(
+        new Response('data: ok\n\n', { status: 200, headers: { 'content-type': 'text/event-stream' } }),
+      );
+    const res = new PassThrough() as any;
+    res.setHeader = vi.fn();
+    res.status = vi.fn().mockReturnThis();
+    res.end = vi.fn();
+    res.flushHeaders = vi.fn();
+
+    const outcome = await withStreamRetry(
+      (ctx) =>
+        proxyStreamRequest(
+          { model: 'm', messages: [{ role: 'user', content: 'hi' }], stream: true },
+          res,
+          { fetchImpl: fetchMock, upstreamUrl: 'http://fake', apiKey: 'k', retryCtx: ctx },
+        ),
+      () => 0,
+    );
+
+    expect(outcome.terminationReason).toBe('done');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(res.status).not.toHaveBeenCalledWith(502); // first-attempt failure suppressed
   });
 });
 
@@ -163,7 +236,7 @@ describe('proxyStreamRequestRecording', () => {
 
     await new Promise((r) => setTimeout(r, 20));
     listeners['close']?.forEach((cb) => cb());
-    release?.();
+    (release as (() => void) | null)?.();
     await promise;
 
     expect(Buffer.concat(recorded).toString('utf8')).toBe('data: 1\n\ndata: 2\n\n');
@@ -185,12 +258,13 @@ describe('proxyStreamRequest + circuit breaker', () => {
     res.status = vi.fn().mockReturnThis();
     res.flushHeaders = vi.fn();
 
-    await proxyStreamRequest(
+    const outcome = await proxyStreamRequest(
       { model: 'm', messages: [{ role: 'user', content: 'hi' }], stream: true },
       res,
       { fetchImpl: fetchMock, upstreamUrl: 'http://fake', apiKey: 'k' },
     );
 
+    expect(outcome.terminationReason).toBe('circuit_open');
     expect(fetchMock).not.toHaveBeenCalled();
     expect(recordStreamOutcome).not.toHaveBeenCalled();
   });
@@ -254,6 +328,129 @@ describe('proxyStreamRequest + circuit breaker', () => {
   });
 });
 
+describe('proxyStreamRequest return value + isFinalAttempt', () => {
+  beforeEach(() => {
+    vi.mocked(checkCircuitOrReject).mockReset().mockResolvedValue(true);
+    vi.mocked(recordStreamOutcome).mockReset().mockResolvedValue();
+  });
+
+  it('returns a StreamOutcome on success', async () => {
+    const body = 'data: a\n\ndata: [DONE]\n\n';
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } }),
+    );
+    const res = new PassThrough() as any;
+    res.setHeader = vi.fn();
+    res.status = vi.fn().mockReturnThis();
+    res.flushHeaders = vi.fn();
+
+    const outcome = await proxyStreamRequest(
+      { model: 'm', messages: [{ role: 'user', content: 'hi' }], stream: true },
+      res,
+      { fetchImpl: fetchMock, upstreamUrl: 'http://fake', apiKey: 'k' },
+    );
+
+    expect(outcome.terminationReason).toBe('done');
+  });
+
+  it('with isFinalAttempt:false, does NOT write 502 on connection_error', async () => {
+    const fetchMock = vi.fn().mockRejectedValue(new Error('ECONNREFUSED'));
+    const res = new PassThrough() as any;
+    res.setHeader = vi.fn();
+    res.status = vi.fn().mockReturnThis();
+    res.end = vi.fn();
+    res.flushHeaders = vi.fn();
+
+    const outcome = await proxyStreamRequest(
+      { model: 'm', messages: [{ role: 'user', content: 'hi' }], stream: true },
+      res,
+      { fetchImpl: fetchMock, upstreamUrl: 'http://fake', apiKey: 'k', retryCtx: { isFinalAttempt: false } },
+    );
+
+    expect(outcome.terminationReason).toBe('connection_error');
+    expect(res.status).not.toHaveBeenCalledWith(502);
+    expect(res.end).not.toHaveBeenCalled();
+    // outcome still recorded to CB (decision 4)
+    expect(recordStreamOutcome).toHaveBeenCalledOnce();
+  });
+
+  it('with isFinalAttempt:true (default), still writes 502 on connection_error', async () => {
+    const fetchMock = vi.fn().mockRejectedValue(new Error('ECONNREFUSED'));
+    const res = new PassThrough() as any;
+    res.setHeader = vi.fn();
+    res.status = vi.fn().mockReturnThis();
+    res.end = vi.fn();
+    res.flushHeaders = vi.fn();
+
+    const outcome = await proxyStreamRequest(
+      { model: 'm', messages: [{ role: 'user', content: 'hi' }], stream: true },
+      res,
+      { fetchImpl: fetchMock, upstreamUrl: 'http://fake', apiKey: 'k' },
+    );
+
+    expect(outcome.terminationReason).toBe('connection_error');
+    expect(res.status).toHaveBeenCalledWith(502);
+    expect(res.end).toHaveBeenCalledOnce();
+  });
+});
+
+describe('proxyStreamRequestRecording return value + isFinalAttempt', () => {
+  beforeEach(() => {
+    vi.mocked(checkCircuitOrReject).mockReset().mockResolvedValue(true);
+    vi.mocked(recordStreamOutcome).mockReset().mockResolvedValue();
+  });
+
+  it('returns a StreamOutcome on success', async () => {
+    const body = 'data: a\n\ndata: [DONE]\n\n';
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } }),
+    );
+    const onChunk = vi.fn();
+    const onEnd = vi.fn();
+    const res = new PassThrough() as any;
+    res.setHeader = vi.fn();
+    res.status = vi.fn().mockReturnThis();
+    res.flushHeaders = vi.fn();
+
+    const outcome = await proxyStreamRequestRecording(
+      { model: 'm', messages: [{ role: 'user', content: 'hi' }], stream: true },
+      res,
+      onChunk,
+      onEnd,
+      { fetchImpl: fetchMock, upstreamUrl: 'http://fake', apiKey: 'k' },
+    );
+
+    expect(outcome.terminationReason).toBe('done');
+  });
+
+  it('with isFinalAttempt:false, does NOT call onChunk/onEnd or write to res on connection_error', async () => {
+    const fetchMock = vi.fn().mockRejectedValue(new Error('ECONNREFUSED'));
+    const onChunk = vi.fn();
+    const onEnd = vi.fn();
+    const res = new PassThrough() as any;
+    res.setHeader = vi.fn();
+    res.status = vi.fn().mockReturnThis();
+    res.end = vi.fn();
+    res.flushHeaders = vi.fn();
+
+    const outcome = await proxyStreamRequestRecording(
+      { model: 'm', messages: [{ role: 'user', content: 'hi' }], stream: true },
+      res,
+      onChunk,
+      onEnd,
+      { fetchImpl: fetchMock, upstreamUrl: 'http://fake', apiKey: 'k', retryCtx: { isFinalAttempt: false } },
+    );
+
+    expect(outcome.terminationReason).toBe('connection_error');
+    expect(onChunk).not.toHaveBeenCalled();
+    expect(onEnd).not.toHaveBeenCalled();
+    expect(res.status).not.toHaveBeenCalledWith(502);
+    expect(res.end).not.toHaveBeenCalled();
+    // outcome still recorded
+    expect(recordStreamOutcome).toHaveBeenCalledOnce();
+  });
+});
+
 describe('proxyStreamRequestRecording + circuit breaker', () => {
   beforeEach(() => {
     vi.mocked(checkCircuitOrReject).mockReset().mockResolvedValue(true);
@@ -271,7 +468,7 @@ describe('proxyStreamRequestRecording + circuit breaker', () => {
     res.flushHeaders = vi.fn();
     res.on = res.on.bind(res);
 
-    await proxyStreamRequestRecording(
+    const outcome = await proxyStreamRequestRecording(
       { model: 'm', messages: [{ role: 'user', content: 'hi' }], stream: true },
       res,
       onChunk,
@@ -279,6 +476,7 @@ describe('proxyStreamRequestRecording + circuit breaker', () => {
       { fetchImpl: fetchMock, upstreamUrl: 'http://fake', apiKey: 'k' },
     );
 
+    expect(outcome.terminationReason).toBe('circuit_open');
     expect(fetchMock).not.toHaveBeenCalled();
     expect(onChunk).not.toHaveBeenCalled();
     expect(onEnd).not.toHaveBeenCalled();

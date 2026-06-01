@@ -10,7 +10,8 @@ export type StreamTerminationReason =
   | 'http_error'
   | 'ttfb_timeout'
   | 'upstream_drop'
-  | 'client_disconnect';
+  | 'client_disconnect'
+  | 'circuit_open';
 
 export interface StreamOutcome {
   terminationReason: StreamTerminationReason;
@@ -35,6 +36,7 @@ export function classifyStreamOutcome(o: StreamOutcome): StreamOutcomeClass {
       return lived < STREAM_EARLY_DROP_MS ? 'failure' : 'ignore';
     }
     case 'client_disconnect':
+    case 'circuit_open':
       return 'ignore';
   }
 }

@@ -66,6 +66,16 @@ describe('classifyStreamOutcome', () => {
     };
     expect(classifyStreamOutcome(o)).toBe('ignore');
   });
+
+  it('returns ignore when circuit was open (never reached upstream)', () => {
+    const o: StreamOutcome = {
+      terminationReason: 'circuit_open',
+      ttfbMs: null,
+      firstByteAtMs: null,
+      droppedAtMs: null,
+    };
+    expect(classifyStreamOutcome(o)).toBe('ignore');
+  });
 });
 
 describe('checkCircuitOrReject', () => {
