@@ -2,7 +2,7 @@ import 'dotenv/config';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { idempotencyMiddleware } from './idempotency';
 import { proxyRequest } from './proxy';
-import { isStreamingRequest, proxyStreamRequest, proxyStreamRequestRecording } from './stream';
+import { isStreamingRequest, proxyStreamRequest, proxyStreamRequestRecording, withStreamRetry } from './stream';
 import { streamIdempotencyMiddleware, keyChunks, SENTINEL_END, SENTINEL_ERR, markDone, markFailed } from './stream-idempotency';
 import { getResult } from './queue';
 import { closeRedis, getRedis } from './redis';
@@ -60,28 +60,33 @@ app.post('/v1/chat', async (req, res) => {
     if (claim?.claimed) {
       const redis = getRedis();
       const chunksKey = keyChunks(claim.key);
-      await proxyStreamRequestRecording(
-        body as Parameters<typeof proxyStreamRequestRecording>[0],
-        res,
-        (buf) => {
-          redis.rpush(chunksKey, buf.toString('base64')).catch((err) =>
-            logger.error({ err, component: 'stream-idem' }, 'chunk RPUSH failed'),
-          );
-        },
-        (ok, status, contentType) => {
-          const terminal = ok ? SENTINEL_END : SENTINEL_ERR;
-          redis.rpush(chunksKey, terminal).catch((err) =>
-            logger.error({ err, component: 'stream-idem' }, 'terminal RPUSH failed'),
-          );
-          const finalize = ok
-            ? markDone(claim.key, status, contentType)
-            : markFailed(claim.key, status, contentType);
-          finalize.catch((err) => logger.error({ err, component: 'stream-idem' }, 'finalize failed'));
-        },
+      await withStreamRetry((ctx) =>
+        proxyStreamRequestRecording(
+          body as Parameters<typeof proxyStreamRequestRecording>[0],
+          res,
+          (buf) => {
+            redis.rpush(chunksKey, buf.toString('base64')).catch((err) =>
+              logger.error({ err, component: 'stream-idem' }, 'chunk RPUSH failed'),
+            );
+          },
+          (ok, status, contentType) => {
+            const terminal = ok ? SENTINEL_END : SENTINEL_ERR;
+            redis.rpush(chunksKey, terminal).catch((err) =>
+              logger.error({ err, component: 'stream-idem' }, 'terminal RPUSH failed'),
+            );
+            const finalize = ok
+              ? markDone(claim.key, status, contentType)
+              : markFailed(claim.key, status, contentType);
+            finalize.catch((err) => logger.error({ err, component: 'stream-idem' }, 'finalize failed'));
+          },
+          { retryCtx: ctx },
+        ),
       );
       return;
     }
-    await proxyStreamRequest(body as Parameters<typeof proxyStreamRequest>[0], res);
+    await withStreamRetry((ctx) =>
+      proxyStreamRequest(body as Parameters<typeof proxyStreamRequest>[0], res, { retryCtx: ctx }),
+    );
     return;
   }
 

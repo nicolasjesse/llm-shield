@@ -99,6 +99,7 @@ describe('POST /v1/chat', () => {
     const spy = vi.spyOn(streamModule, 'proxyStreamRequest').mockImplementation(async (_b, res) => {
       res.status(200).setHeader('content-type', 'text/event-stream');
       res.end('data: ok\n\n');
+      return { terminationReason: 'done', ttfbMs: null, firstByteAtMs: null, droppedAtMs: null };
     });
 
     const res = await request(app)
@@ -129,9 +130,12 @@ describe('POST /v1/chat', () => {
         onEnd(true, 200, 'text/event-stream');
         res.status(200).setHeader('content-type', 'text/event-stream');
         res.end('data: ok\n\n');
+        return { terminationReason: 'done', ttfbMs: null, firstByteAtMs: null, droppedAtMs: null };
       },
     );
-    const passSpy = vi.spyOn(streamModule, 'proxyStreamRequest').mockImplementation(async () => {});
+    const passSpy = vi.spyOn(streamModule, 'proxyStreamRequest').mockImplementation(
+      async () => ({ terminationReason: 'done', ttfbMs: null, firstByteAtMs: null, droppedAtMs: null }),
+    );
 
     const res = await request(app)
       .post('/v1/chat')

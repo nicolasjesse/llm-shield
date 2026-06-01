@@ -8,7 +8,10 @@ export class RetryExhaustedError extends Error {
   }
 }
 
-const RETRY_DELAYS_MS = [1000, 2000, 4000];
+export const RETRY_DELAYS_MS = [1000, 2000, 4000];
+
+export const defaultRetryDelayMs = (attempt: number): number =>
+  RETRY_DELAYS_MS[Math.min(attempt, RETRY_DELAYS_MS.length - 1)];
 
 function isRetryable(status: number): boolean {
   return status === 429 || (status >= 500 && status <= 599);
@@ -16,7 +19,7 @@ function isRetryable(status: number): boolean {
 
 export async function withRetry(
   fn: () => Promise<Response>,
-  delayMs: (attempt: number) => number = (i) => RETRY_DELAYS_MS[Math.min(i, RETRY_DELAYS_MS.length - 1)],
+  delayMs: (attempt: number) => number = defaultRetryDelayMs,
 ): Promise<Response> {
   let lastStatus = 0;
 

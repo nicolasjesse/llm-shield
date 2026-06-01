@@ -45,7 +45,7 @@ describe('observability', () => {
       const captureSpy = vi.spyOn(observability, 'captureEvent');
       vi.spyOn(circuitBreaker, 'getState').mockResolvedValue('OPEN');
       vi.spyOn(circuitBreaker, 'withCircuitBreaker').mockImplementation(async () => {
-        throw new circuitBreaker.CircuitOpenError('circuit is OPEN');
+        throw new circuitBreaker.CircuitOpenError();
       });
 
       const res = await request(app)
